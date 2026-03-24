@@ -1,11 +1,11 @@
 {
   "name": "dxkit",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Developer experience toolkit — drift detection, context compilation, code review, git archaeology, and pattern harvesting",
   "type": "module",
   "bin": {
-    "dxkit": "./dist/cli.js",
-    "dx": "./dist/cli.js"
+    "dxkit": "./bin/dxkit.js",
+    "dx": "./bin/dxkit.js"
   },
   "scripts": {
     "build": "tsup src/cli.ts --format esm --dts --clean",

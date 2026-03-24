@@ -7,6 +7,7 @@ export function driftCommand(): Command {
     .argument('[path]', 'Path to scan', '.')
     .option('--docs <dirs>', 'Doc directories, comma-separated (supports absolute paths)')
     .option('--src <dirs>', 'Source directories, comma-separated (supports absolute paths)')
+    .option('--mode <type>', 'Doc type: "dev" (inline/API docs) or "product" (customer-facing docs)', 'dev')
     .option('--fix', 'Show fixable issues with diff previews (dry run)')
     .option('--apply', 'Apply fixes (use with --fix)')
     .option('--ai', 'AI-powered semantic drift detection')
@@ -32,8 +33,10 @@ export function driftCommand(): Command {
       const { renderReport } = await import('../lib/drift/renderer.js');
       const { generateFixes } = await import('../lib/drift/fixer.js');
 
+      const isProduct = opts.mode === 'product';
       console.log(chalk.bold.cyan('\n  dx drift') + chalk.dim(` — Documentation Drift Detector\n`));
-      if (opts.ai) console.log(chalk.dim(`  Mode: AI-enhanced`));
+      if (opts.ai) console.log(chalk.dim(`  AI: enabled`));
+      console.log(chalk.dim(`  Mode: ${isProduct ? 'product docs (customer-facing)' : 'dev docs (inline/API)'}`));
       console.log(chalk.dim(`  Scanning: ${scanPath}\n`));
 
       if (opts.apply && !opts.fix) {
@@ -50,15 +53,27 @@ export function driftCommand(): Command {
         const symbols = await buildSymbolTable(scanPath, opts.src);
         process.stdout.write(`\r  ${chalk.green('✓')} Found ${chalk.bold(symbols.size.toString())} exported symbols\n`);
 
-        process.stdout.write(chalk.yellow('  ◐ Cross-referencing...'));
-        const findings = crossReference(docs, symbols);
-        process.stdout.write(`\r  ${chalk.green('✓')} Analysis complete\n\n`);
-
-        if (opts.json && !opts.ai) {
-          console.log(JSON.stringify(findings, null, 2));
-        } else if (!opts.ai) {
-          renderReport(findings, symbols);
+        // Static analysis: full report for dev docs, compact summary for product docs
+        let findings: any[] = [];
+        if (!isProduct) {
+          process.stdout.write(chalk.yellow('  ◐ Cross-referencing...'));
+          findings = crossReference(docs, symbols);
+          process.stdout.write(`\r  ${chalk.green('✓')} Analysis complete\n\n`);
         } else {
+          console.log(chalk.dim('  ⏭ Skipping static symbol matching (not useful for product docs)\n'));
+        }
+
+        if (!opts.ai && !isProduct) {
+          if (opts.json) {
+            console.log(JSON.stringify(findings, null, 2));
+          } else {
+            renderReport(findings, symbols);
+          }
+        } else if (!opts.ai && isProduct) {
+          console.log(chalk.yellow('  Product docs mode works best with --ai. Without it, there\'s not much to check.\n'));
+          console.log(chalk.dim(`  Try: dx drift ${scanPath} --mode product --ai\n`));
+        } else if (opts.ai && !isProduct) {
+          // Dev mode with AI: show static summary first
           const broken = findings.filter(f => f.severity === 'BROKEN').length;
           const stale = findings.filter(f => f.severity === 'STALE').length;
           const missing = findings.filter(f => f.severity === 'MISSING').length;
@@ -74,6 +89,7 @@ export function driftCommand(): Command {
             apiKey: opts.aiKey,
             model: opts.aiModel,
             prompt: opts.aiPrompt,
+            mode: opts.mode,
           });
           if (opts.json) {
             console.log(JSON.stringify({ static: findings, ai: aiFindings }, null, 2));

@@ -36,6 +36,26 @@ dx drift . --docs ~/work/docs-portal/content --src ~/work/api/src,~/work/sdk/src
 
 That last one is the power move: docs from your docs repo, source from three other repos.
 
+#### Dev docs vs. product docs
+
+By default, drift assumes developer-facing docs — READMEs, API references, inline markdown that references function names and file paths. If you're scanning customer-facing product docs (Astro Starlight, Docusaurus, GitBook, etc.), use `--mode product`:
+
+```bash
+# Product docs: skip static symbol matching, tell the AI to look for
+# wrong defaults, missing features, stale config options
+dx drift . --docs apps/docs/content --src libs,apps/api --mode product --ai
+
+# Dev docs (default): cross-reference backticked symbols against exports
+dx drift . --docs docs --src src
+```
+
+In product mode, the static pass is skipped entirely (it would just produce noise — product docs don't reference `connectDB()` or `src/auth.ts`). The AI gets a different briefing that tells it to focus on:
+
+- Default values and limits that don't match source constants
+- Described features or config options the code doesn't implement
+- Template variables or filter names that aren't registered in source
+- UI behavior descriptions that contradict the actual implementation
+
 ### `dx ctx` — context before you start
 
 Run this before you touch anything. Give it a plain English description of what you're about to do, and it builds a briefing: which files to start with, recent git history, related tests, and every TODO/FIXME lurking in the area.

@@ -10,7 +10,7 @@ import { DocFile } from './scanner.js';
 import { SymbolInfo } from './symbols.js';
 
 export interface AIDriftFinding {
-  severity: 'BROKEN' | 'STALE' | 'OUTDATED' | 'MISSING';
+  severity: 'BROKEN' | 'STALE' | 'OUTDATED';
   docFile: string;
   line?: number;
   claim: string;
@@ -31,6 +31,7 @@ export interface AIOptions {
   apiKey?: string;
   model?: string;     // e.g. "claude-opus-4-20250514", "gpt-4o-mini"
   prompt?: string;     // path to custom prompt file
+  mode?: string;       // "dev" or "product"
 }
 
 // ─── Provider setup ───────────────────────────────────────────
@@ -145,7 +146,7 @@ function getDefaultPrompt(): string {
   } catch { /* bundled mode, use inline fallback */ }
 
   // Inline fallback
-  return `You are a documentation drift detector. Your job is to find claims in documentation that don't match the actual source code.
+  return `You are a documentation drift detector. You compare documentation against source code to find **provable contradictions**.
 
 ## Documentation File: {{docPath}}
 
@@ -153,42 +154,51 @@ function getDefaultPrompt(): string {
 {{doc}}
 \`\`\`
 
-## Source Code Context (exports, functions, constants, types):
+## Source Code Context
 
 {{source}}
 
-## Instructions
+## What to look for
 
-Analyze the documentation and compare it against the source code context. Find:
+Find places where the documentation **contradicts** the source code:
 
-1. **STALE references** — Functions, classes, variables, types mentioned in docs that don't exist in source
-2. **OUTDATED claims** — Default values, config options, behavior described in docs that contradicts source
-3. **MISSING docs** — Important source exports/features not mentioned in the docs at all
-4. **BROKEN references** — File paths, import paths, or URLs in docs that look incorrect
+1. **STALE** — A function, class, or variable name in the docs that does NOT appear in the exported symbols. Wrong name or renamed.
+2. **OUTDATED** — A specific claim (default value, config option, parameter, behavior) directly contradicted by source code you can see.
+3. **BROKEN** — A file path or import path that doesn't match any file in the symbol index.
 
-For each finding, respond with a JSON array. Each item:
-{
-  "severity": "BROKEN" | "STALE" | "OUTDATED" | "MISSING",
-  "line": <approximate line number in the doc, or null>,
-  "claim": "<what the doc says>",
-  "reality": "<what the source code actually shows>",
-  "suggestion": "<how to fix it>",
-  "confidence": "high" | "medium" | "low",
-  "sourceFile": "<relevant source file path, or null>"
-}
+## What NOT to flag
 
-Rules:
-- Only report findings you're confident about. Don't guess.
-- If a doc references things that could be in code you can't see, mark it "low" confidence.
-- Be specific: quote the exact doc text and the exact source code that contradicts it.
-- Focus on factual drift, not style or grammar.
-- If the docs are correct, return an empty array: []
+- Do NOT flag something as missing just because you can't see the implementation. The source context is a subset.
+- Do NOT flag "no source code visible for X." That is a context limitation, not a finding.
+- Do NOT flag documentation style, grammar, or completeness.
+- Do NOT flag template syntax like {{ variable }} as code references.
+- Do NOT invent findings. If docs look correct, return [].
+
+Respond with a JSON array. Each item:
+{ "severity": "BROKEN" | "STALE" | "OUTDATED", "line": <number or null>, "claim": "<exact doc text>", "reality": "<what source shows, cite file/symbol>", "suggestion": "<fix>", "confidence": "high" | "medium" | "low", "sourceFile": "<proof file or null>" }
+
+Every finding MUST cite a source file or symbol. No evidence = no finding.
+Return [] if docs are correct.
 
 Respond ONLY with a valid JSON array, no other text.`;
 }
 
-function renderPrompt(template: string, vars: { docPath: string; doc: string; source: string }): string {
-  return template
+function renderPrompt(template: string, vars: { docPath: string; doc: string; source: string; mode: string }): string {
+  const modeContext = vars.mode === 'product'
+    ? `## Document Type: PRODUCT DOCUMENTATION (customer-facing)
+
+These docs describe features, UI behavior, configuration options, and workflows from a user's perspective.
+They will NOT reference internal function names, file paths, or imports directly.
+Instead, look for:
+- Feature descriptions that contradict what the source code implements
+- Default values, limits, or timeouts that don't match constants in source
+- Described behavior or config options that the source code doesn't support
+- Template variables or filter names mentioned in docs that aren't registered in source
+- Described steps/triggers/integrations that have no corresponding implementation
+Do NOT flag internal code references as missing — these docs intentionally avoid them.\n\n`
+    : '';
+
+  return (modeContext + template)
     .replace(/\{\{docPath\}\}/g, vars.docPath)
     .replace(/\{\{doc\}\}/g, vars.doc)
     .replace(/\{\{source\}\}/g, vars.source);
@@ -236,7 +246,11 @@ export async function runAIAnalysis(
   const resolvedBase = resolve(basePath);
   const allFindings: AIDriftFinding[] = [];
 
-  const sourceContext = await buildSourceContext(resolvedBase, symbols);
+  // Build full symbol index (compact) + per-doc relevant context
+  process.stdout.write(chalk.yellow('  ◐ Building source context...'));
+  const symbolIndex = buildSymbolIndex(symbols);
+  const sourceFiles = await indexSourceFiles(resolvedBase);
+  process.stdout.write(`\r  ${chalk.green('✓')} Indexed ${chalk.bold(sourceFiles.size.toString())} source files\n\n`);
 
   const maxFiles = opts.maxFiles || 10;
   const docsToProcess = docs.slice(0, maxFiles);
@@ -246,7 +260,9 @@ export async function runAIAnalysis(
     process.stdout.write(`  ${chalk.yellow('◐')} [${i + 1}/${docsToProcess.length}] Analyzing ${chalk.dim(doc.relativePath)}...`);
 
     try {
-      const findings = await analyzeDocWithAI(doc, sourceContext, provider, template);
+      // Build doc-specific context: full symbol index + relevant source snippets
+      const docContext = buildDocSpecificContext(doc, symbolIndex, symbols, sourceFiles);
+      const findings = await analyzeDocWithAI(doc, docContext, provider, template, opts.mode || 'dev');
       allFindings.push(...findings);
       process.stdout.write(`\r  ${chalk.green('✓')} [${i + 1}/${docsToProcess.length}] ${doc.relativePath}: ${chalk.bold(findings.length.toString())} findings\n`);
     } catch (err: any) {
@@ -262,11 +278,13 @@ async function analyzeDocWithAI(
   sourceContext: string,
   provider: AIProvider,
   template: string,
+  mode: string,
 ): Promise<AIDriftFinding[]> {
   const prompt = renderPrompt(template, {
     docPath: doc.relativePath,
     doc: doc.content.substring(0, 8000),
-    source: sourceContext.substring(0, 12000),
+    source: sourceContext.substring(0, 20000),
+    mode,
   });
 
   const { text } = await generateText({
@@ -297,13 +315,8 @@ async function analyzeDocWithAI(
 
 // ─── Source context builder ───────────────────────────────────
 
-async function buildSourceContext(
-  basePath: string,
-  symbols: Map<string, SymbolInfo>,
-): Promise<string> {
-  const lines: string[] = [];
-
-  lines.push('### Exported Symbols\n');
+// Compact symbol index: all exports in a dense format the AI can scan
+function buildSymbolIndex(symbols: Map<string, SymbolInfo>): string {
   const byFile = new Map<string, SymbolInfo[]>();
   for (const [, sym] of symbols) {
     if (!sym.exported) continue;
@@ -312,16 +325,26 @@ async function buildSourceContext(
     byFile.set(sym.relativePath, arr);
   }
 
-  for (const [file, syms] of [...byFile.entries()].slice(0, 50)) {
-    lines.push(`**${file}**:`);
-    for (const sym of syms) {
-      lines.push(`  - ${sym.exported ? 'export ' : ''}${sym.type} ${sym.name} (line ${sym.line})`);
-    }
+  const lines: string[] = ['## All Exported Symbols\n'];
+
+  // Compact format: one line per file, comma-separated symbols
+  for (const [file, syms] of byFile) {
+    const symList = syms.map(s => `${s.type[0]}:${s.name}`).join(', ');
+    lines.push(`${file} → ${symList}`);
   }
 
-  lines.push('\n### Key Source Snippets\n');
+  return lines.join('\n');
+}
 
-  const configFiles = await glob(
+interface SourceFileEntry {
+  path: string;
+  relativePath: string;
+  content: string;
+}
+
+// Index source files for per-doc relevance matching
+async function indexSourceFiles(basePath: string): Promise<Map<string, SourceFileEntry>> {
+  const files = await glob(
     ['**/*.{ts,tsx,js,jsx}'],
     {
       cwd: basePath,
@@ -330,36 +353,137 @@ async function buildSourceContext(
     }
   );
 
-  for (const filePath of configFiles.slice(0, 100)) {
+  const index = new Map<string, SourceFileEntry>();
+  for (const filePath of files) {
     try {
       const content = readFileSync(filePath, 'utf-8');
-      const relPath = relative(basePath, filePath);
-
-      const interestingLines: string[] = [];
-      const fileLines = content.split('\n');
-      for (let i = 0; i < fileLines.length; i++) {
-        const line = fileLines[i];
-        if (
-          /(?:export\s+)?(?:const|enum|default|DEFAULT|TIMEOUT|MAX_|MIN_|LIMIT)/i.test(line) ||
-          /(?:defaults?|config|options)\s*[:=]/i.test(line) ||
-          /(?:registerFilter|addFilter|register(?:Step|Trigger|Handler))/i.test(line)
-        ) {
-          const snippet = fileLines.slice(i, Math.min(i + 4, fileLines.length)).join('\n');
-          interestingLines.push(`  L${i + 1}: ${snippet}`);
-          if (interestingLines.length >= 10) break;
-        }
-      }
-
-      if (interestingLines.length > 0) {
-        lines.push(`**${relPath}**:`);
-        lines.push(interestingLines.join('\n'));
-        lines.push('');
-      }
+      if (content.length > 100_000) continue; // skip huge generated files
+      const relativePath = relative(basePath, filePath);
+      index.set(relativePath, { path: filePath, relativePath, content });
     } catch { /* skip */ }
+  }
+
+  return index;
+}
+
+// Build context specific to a doc: full symbol index + relevant source snippets
+function buildDocSpecificContext(
+  doc: DocFile,
+  symbolIndex: string,
+  symbols: Map<string, SymbolInfo>,
+  sourceFiles: Map<string, SourceFileEntry>,
+): string {
+  const lines: string[] = [];
+
+  // Always include the full symbol index (compact, usually 5-15KB)
+  lines.push(symbolIndex);
+  lines.push('');
+
+  // Extract keywords from the doc to find relevant source files
+  const docKeywords = extractDocKeywords(doc.content);
+
+  // Score each source file by relevance to this doc
+  const scored: { file: SourceFileEntry; score: number }[] = [];
+  for (const [, entry] of sourceFiles) {
+    let score = 0;
+    const pathLower = entry.relativePath.toLowerCase();
+    const contentLower = entry.content.toLowerCase();
+
+    for (const kw of docKeywords) {
+      const kwLower = kw.toLowerCase();
+      // Path match is strong signal
+      if (pathLower.includes(kwLower)) score += 10;
+      // Content match
+      const matches = contentLower.split(kwLower).length - 1;
+      if (matches > 0) score += Math.min(matches, 5);
+    }
+
+    if (score > 0) scored.push({ file: entry, score });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+
+  // Include top relevant source files (snippets of exports, defaults, config)
+  const topFiles = scored.slice(0, 20);
+  if (topFiles.length > 0) {
+    lines.push('## Relevant Source Code (matched to this doc)\n');
+
+    for (const { file, score } of topFiles) {
+      const snippets = extractRelevantSnippets(file.content, docKeywords);
+      if (snippets.length > 0) {
+        lines.push(`### ${file.relativePath} (relevance: ${score})\n`);
+        lines.push('```');
+        lines.push(snippets.join('\n---\n'));
+        lines.push('```\n');
+      }
+    }
   }
 
   return lines.join('\n');
 }
+
+function extractDocKeywords(content: string): string[] {
+  const keywords = new Set<string>();
+
+  // Extract backticked references
+  const backticked = content.match(/`([a-zA-Z_$][\w.$-]*(?:\(\))?)`/g) || [];
+  for (const bt of backticked) {
+    const clean = bt.replace(/`/g, '').replace(/\(\)$/, '');
+    if (clean.length > 2) keywords.add(clean);
+  }
+
+  // Extract heading words (likely feature names)
+  const headings = content.match(/^#{1,3}\s+(.+)$/gm) || [];
+  for (const h of headings) {
+    const words = h.replace(/^#+\s+/, '').split(/[\s,/]+/);
+    for (const w of words) {
+      if (w.length > 3 && !/^(the|and|for|with|how|what|your|this|that|from|into|when|about|using)$/i.test(w)) {
+        keywords.add(w);
+      }
+    }
+  }
+
+  // Extract template variable references like {{ $util.uuid }}, {{ initial.webhook }}
+  const templateVars = content.match(/\{\{\s*([\w.$]+)\s*\}\}/g) || [];
+  for (const tv of templateVars) {
+    const parts = tv.replace(/[{}]/g, '').trim().split('.');
+    for (const p of parts) {
+      if (p.length > 2 && !p.startsWith('$')) keywords.add(p);
+    }
+  }
+
+  return [...keywords].slice(0, 30);
+}
+
+function extractRelevantSnippets(content: string, keywords: string[]): string[] {
+  const lines = content.split('\n');
+  const snippets: string[] = [];
+  const seen = new Set<number>();
+
+  for (let i = 0; i < lines.length; i++) {
+    if (seen.has(i)) continue;
+    const line = lines[i];
+
+    // Check if this line is relevant (export, default, config, or keyword match)
+    const isExport = /^export\s/.test(line);
+    const isConfig = /(?:default|DEFAULT|config|const\s+\w+\s*=)/i.test(line);
+    const hasKeyword = keywords.some(kw => line.toLowerCase().includes(kw.toLowerCase()));
+
+    if (isExport || isConfig || hasKeyword) {
+      // Grab a window of context
+      const start = Math.max(0, i - 1);
+      const end = Math.min(lines.length, i + 5);
+      const snippet = lines.slice(start, end).map((l, idx) => `L${start + idx + 1}: ${l}`).join('\n');
+      snippets.push(snippet);
+      for (let j = start; j < end; j++) seen.add(j);
+
+      if (snippets.length >= 15) break; // cap per file
+    }
+  }
+
+  return snippets;
+}
+
 
 // ─── Report renderer ──────────────────────────────────────────
 
@@ -375,26 +499,24 @@ export function renderAIReport(findings: AIDriftFinding[]): void {
   console.log(chalk.bold('  └──────────────────────────────────────────────────┘'));
   console.log();
 
-  const counts = { BROKEN: 0, STALE: 0, OUTDATED: 0, MISSING: 0 };
+  const counts = { BROKEN: 0, STALE: 0, OUTDATED: 0 };
   for (const f of findings) counts[f.severity] = (counts[f.severity] || 0) + 1;
 
-  console.log(`  ${chalk.red.bold(`${counts.BROKEN} broken`)}  ${chalk.yellow.bold(`${counts.STALE} stale`)}  ${chalk.magenta.bold(`${counts.OUTDATED} outdated`)}  ${chalk.blue(`${counts.MISSING} missing`)}`);
+  console.log(`  ${chalk.red.bold(`${counts.BROKEN} broken`)}  ${chalk.yellow.bold(`${counts.STALE} stale`)}  ${chalk.magenta.bold(`${counts.OUTDATED} outdated`)}`);
   console.log();
 
-  const severityOrder = { BROKEN: 0, STALE: 1, OUTDATED: 2, MISSING: 3 };
+  const severityOrder: Record<string, number> = { BROKEN: 0, STALE: 1, OUTDATED: 2 };
   findings.sort((a, b) => severityOrder[a.severity] - severityOrder[b.severity]);
 
   const severityColors: Record<string, (s: string) => string> = {
     BROKEN: chalk.red.bold,
     STALE: chalk.yellow.bold,
     OUTDATED: chalk.magenta.bold,
-    MISSING: chalk.blue,
   };
   const severityIcons: Record<string, string> = {
     BROKEN: '✖',
     STALE: '⚠',
     OUTDATED: '⟳',
-    MISSING: '◎',
   };
   const confColors: Record<string, (s: string) => string> = {
     high: chalk.green,
