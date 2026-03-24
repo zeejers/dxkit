@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Resolve symlinks to get the real devkit directory
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+
+exec npx --prefix "$DIR" tsx "$DIR/src/cli.ts" "$@"
