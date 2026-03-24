@@ -31,6 +31,7 @@ export interface AIOptions {
   apiKey?: string;
   model?: string;     // e.g. "claude-opus-4-20250514", "gpt-4o-mini"
   prompt?: string;     // path to custom prompt file
+  mode?: string;       // "dev" or "product"
 }
 
 // ─── Provider setup ───────────────────────────────────────────
@@ -182,8 +183,22 @@ Return [] if docs are correct.
 Respond ONLY with a valid JSON array, no other text.`;
 }
 
-function renderPrompt(template: string, vars: { docPath: string; doc: string; source: string }): string {
-  return template
+function renderPrompt(template: string, vars: { docPath: string; doc: string; source: string; mode: string }): string {
+  const modeContext = vars.mode === 'product'
+    ? `## Document Type: PRODUCT DOCUMENTATION (customer-facing)
+
+These docs describe features, UI behavior, configuration options, and workflows from a user's perspective.
+They will NOT reference internal function names, file paths, or imports directly.
+Instead, look for:
+- Feature descriptions that contradict what the source code implements
+- Default values, limits, or timeouts that don't match constants in source
+- Described behavior or config options that the source code doesn't support
+- Template variables or filter names mentioned in docs that aren't registered in source
+- Described steps/triggers/integrations that have no corresponding implementation
+Do NOT flag internal code references as missing — these docs intentionally avoid them.\n\n`
+    : '';
+
+  return (modeContext + template)
     .replace(/\{\{docPath\}\}/g, vars.docPath)
     .replace(/\{\{doc\}\}/g, vars.doc)
     .replace(/\{\{source\}\}/g, vars.source);
@@ -247,7 +262,7 @@ export async function runAIAnalysis(
     try {
       // Build doc-specific context: full symbol index + relevant source snippets
       const docContext = buildDocSpecificContext(doc, symbolIndex, symbols, sourceFiles);
-      const findings = await analyzeDocWithAI(doc, docContext, provider, template);
+      const findings = await analyzeDocWithAI(doc, docContext, provider, template, opts.mode || 'dev');
       allFindings.push(...findings);
       process.stdout.write(`\r  ${chalk.green('✓')} [${i + 1}/${docsToProcess.length}] ${doc.relativePath}: ${chalk.bold(findings.length.toString())} findings\n`);
     } catch (err: any) {
@@ -263,11 +278,13 @@ async function analyzeDocWithAI(
   sourceContext: string,
   provider: AIProvider,
   template: string,
+  mode: string,
 ): Promise<AIDriftFinding[]> {
   const prompt = renderPrompt(template, {
     docPath: doc.relativePath,
     doc: doc.content.substring(0, 8000),
-    source: sourceContext.substring(0, 12000),
+    source: sourceContext.substring(0, 20000),
+    mode,
   });
 
   const { text } = await generateText({
