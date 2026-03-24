@@ -1,5 +1,5 @@
 {
-  "name": "@zeejers/dxkit",
+  "name": "@sherbondito/dxkit",
   "version": "1.0.1",
   "description": "Developer experience toolkit — drift detection, context compilation, code review, git archaeology, and pattern harvesting",
   "type": "module",
